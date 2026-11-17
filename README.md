@@ -1,8 +1,9 @@
 # TCP 延迟代理（慢链路“上传结束收不到回执”复现工具）
 
-带网页的 TCP 延迟代理：可配置目标地址与上下行延迟，网页上直接上传文件试传，
+带网页的 TCP 延迟代理：可配置目标地址、上下行延迟与停滞时限，网页上直接上传文件试传，
 实时显示每条连接的回执、双向字节数与缓冲峰值。用于在本地复现慢链路下
-“上传结束却收不到回执”的问题。
+“上传结束却收不到回执”以及“目标停读 / 不回执导致连接卡死”的问题：
+双向都没有实际转发超过停滞时限的连接会被代理主动终止并标记，避免长期占住代理。
 
 ## 快速开始（Docker Compose）
 
@@ -12,11 +13,15 @@ docker compose up --build
 
 * 网页 / API：http://localhost:8000
 * TCP 延迟代理监听：`localhost:7000`（可直接对接设备或客户端）
-* 示例接收端：容器网络内 `receiver:9000`（先发欢迎行，读到 EOF 后回
-  `RECEIPT bytes=<n> sha256=<hex>`）
+* 示例接收端（容器网络内，目标地址在网页上可改）：
+  * `receiver:9000`：正常——先发欢迎行，读到 EOF 后回
+    `RECEIPT bytes=<n> sha256=<hex>`
+  * `receiver-stopread:9000`：模拟目标停读——读满 128 KiB 后停止读取但保持连接
+  * `receiver-noreceipt:9000`：模拟不回执——读到 EOF 后不发回执、保持连接
 
-网页上可修改监听地址/端口、目标地址、上下行延迟（毫秒），保存后对**之后建立
-的连接**生效；已建立的连接沿用建立时的配置。修改监听地址/端口会重启监听器。
+网页上可修改监听地址/端口、目标地址、上下行延迟（毫秒）与停滞时限（1～30 秒），
+保存后对**之后建立的连接**生效；已建立的连接沿用建立时的配置（含停滞时限）。
+修改监听地址/端口会重启监听器。
 
 ## 复现“慢链路收不到回执”
 
@@ -25,6 +30,18 @@ docker compose up --build
 3. 在“活动连接”里观察：上行缓冲被 64 KiB 上限顶住、EOF 等待队列冲刷后才
    半关闭、回执（下行尾部）在延迟后才到达——上传“结束”与回执到达之间的
    时间差即慢链路效应。
+
+## 复现“目标停读 / 不回执”卡死连接
+
+1. 把停滞时限调小（例如 2 秒）；
+2. 目标地址改为 `receiver-stopread`（停读）或 `receiver-noreceipt`（不回执）；
+3. 上传试传：
+   * 停读：文件大于内核缓冲（本机约几 MiB，内核相关）时，上行缓冲顶满、
+     转发停滞，连接在**上行阶段**被判定停滞；文件较小时数据被内核缓冲吞下、
+     EOF 已转发，表现为**等回执阶段**停滞（语义同样正确：代理视角上传已结束）。
+   * 不回执：上传与 EOF 都正常转发，回执始终不来，连接在**等回执阶段**停滞。
+4. 试传结果显示“未确认”；连接表中该连接状态为 `stalled`，并记录停滞阶段与
+   双向已转发字节；其他连接照常传输。
 
 ## 关键语义（实现于 `proxy/app/engine.py`）
 
@@ -36,7 +53,16 @@ docker compose up --build
   转发半关闭；反向继续传输直到结束。
 * **断连释放**：正常结束或对端 RST 都会取消泵任务、清空队列、关闭两侧
   连接，并把连接移入历史表。
-* **配置快照**：每条连接在 accept 时快照配置，整条连接沿用。
+* **配置快照**：每条连接在 accept 时快照配置（含停滞时限），整条连接沿用。
+* **停滞时限**（1～30 秒）：某方向“实际转发”（写出并 `drain` 成功，或 EOF
+  送达对端）停滞超过 `max(最后进展时刻, 队首块投递时刻) + 时限`，且双向同时
+  停滞时，终止该连接：
+  * 已读未写的数据仍在配置延迟期内（队首块未到投递时刻）不算停滞；延迟期
+    结束后仍无进展，最多再等一个停滞时限；
+  * 上行 EOF 只在待发字节冲刷完并转给目标后才算进展；下行未结束照常计时；
+  * 判定时记录阶段（`up`=上行 / `receipt`=等回执）与双向已转发字节，状态
+    置为 `stalled`；终止后迟到的回执不覆盖该结果；
+  * 网页试传在回执未确认时显示“未确认”。
 
 ## 本地开发（不用 Docker）
 
@@ -44,9 +70,12 @@ docker compose up --build
 pip install -r proxy/requirements.txt
 PORT=19000 python3 receiver/server.py &
 cd proxy && LISTEN_PORT=17000 TARGET_HOST=127.0.0.1 TARGET_PORT=19000 \
-  UP_DELAY_MS=300 DOWN_DELAY_MS=300 \
+  UP_DELAY_MS=300 DOWN_DELAY_MS=300 STALL_TIMEOUT_S=10 \
   uvicorn app.main:app --host 127.0.0.1 --port 18000
 ```
+
+接收端卡死模拟（环境变量）：`MODE=stop-read`（配 `STOP_READ_AFTER_BYTES`）、
+`MODE=no-receipt`；卡死连接最多保持 `HOLD_S` 秒（默认 300）后自行关闭。
 
 ## 自测
 
@@ -55,31 +84,34 @@ python3 tests/selftest.py   # 需按上面方式起好接收端与代理（端�
 ```
 
 覆盖：回执字节数/SHA-256 校验、延迟流水化（非按块累加）、64 KiB 缓冲上限
-与峰值、EOF 先冲刷再半关闭、连接级配置快照、并发上传、RST 断连释放。
+与峰值、EOF 先冲刷再半关闭、连接级配置快照（含停滞时限）、并发上传、
+RST 断连释放、停滞时限取值校验（仅 1～30）、延迟期内不误判、不回执→等回执
+阶段停滞且试传未确认、停读→上行阶段停滞且其他连接照常、迟到回执不覆盖停滞
+结果。（停读/不回执/迟到回执目标由脚本在 19011～19013 端口自起。）
 
 ## API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/config` | 当前配置与监听状态 |
-| POST | `/api/config` | 更新配置（仅影响新连接） |
-| GET | `/api/connections` | 活动+历史连接：双向字节数、缓冲当前/峰值、回执尾部 |
-| POST | `/api/test-upload` |  multipart 上传文件，经代理试传并返回回执 |
+| GET | `/api/config` | 当前配置（含 `stall_timeout_s`）与监听状态 |
+| POST | `/api/config` | 更新配置（仅影响新连接；`stall_timeout_s` 限 1～30） |
+| GET | `/api/connections` | 活动+历史连接：双向字节数/已转发、缓冲当前/峰值、回执尾部、`stall` 判定 |
+| POST | `/api/test-upload` |  multipart 上传文件，经代理试传并返回回执；未收到回执时 `unconfirmed=true` 并附 `proxy_conn`（含停滞记录） |
 | POST | `/api/history/clear` | 清空历史连接 |
 
 ## 目录结构
 
 ```
-docker-compose.yml      # proxy + receiver 一键启动
+docker-compose.yml      # proxy + receiver（正常/停读/不回执）一键启动
 proxy/
   Dockerfile
   requirements.txt
   app/
     main.py             # FastAPI：配置/统计/试传/网页
-    engine.py           # 延迟代理引擎（asyncio，无第三方依赖）
+    engine.py           # 延迟代理引擎（asyncio，无第三方依赖，含停滞看门狗）
     static/index.html   # 网页
 receiver/
   Dockerfile
-  server.py             # 示例接收端：欢迎行 + EOF 后回执(字节数+SHA-256)
+  server.py             # 示例接收端：正常 / 停读 / 不回执三种模式
 tests/selftest.py       # 端到端自测
 ```

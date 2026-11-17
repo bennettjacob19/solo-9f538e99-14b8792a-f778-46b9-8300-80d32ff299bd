@@ -17,16 +17,18 @@ table { border-collapse: collapse; width: 100%; font-size: 12px; }
 th, td { border: 1px solid #e0e0e0; padding: 3px 6px; text-align: left; vertical-align: top; }
 th { background: #f5f5f5; white-space: nowrap; }
 .ok { color: #0a7d2c; } .err { color: #c00; }
+.unconf { color: #b26a00; font-weight: 600; }
 .muted { color: #777; font-size: 12px; }
 pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
 .pill { padding: 1px 8px; border-radius: 10px; font-size: 11px; white-space: nowrap; }
 .st-active { background: #e7f5ff; } .st-closed { background: #ebfbee; } .st-error { background: #fff5f5; }
+.st-stalled { background: #ffe8cc; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
 <h1>TCP 延迟代理 <span class="muted">慢链路下“上传结束却收不到回执”复现工具</span></h1>
-<div class="sub">延迟自代理读到字节起算，连续数据流水发送（不按块累加等待）；每向应用缓冲 ≤ 64 KiB，满则暂停该向读取；单向 EOF 先冲刷待发字节再转发半关闭，反向继续到结束。</div>
+<div class="sub">延迟自代理读到字节起算，连续数据流水发送（不按块累加等待）；每向应用缓冲 ≤ 64 KiB，满则暂停该向读取；单向 EOF 先冲刷待发字节再转发半关闭，反向继续到结束。双向都没有实际转发超过停滞时限的连接会被终止并标记 stalled（区分上行 / 等回执阶段）。</div>
 
 <div class="card">
   <h2>代理配置</h2>
@@ -34,8 +36,9 @@ pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-w
   <div><label>目标地址</label><input id="target_host" size="14"> : <input id="target_port" type="number" style="width:90px"></div>
   <div><label>上行延迟 (ms)</label><input id="up_delay_ms" type="number" min="0" style="width:110px"> <span class="muted">客户端 → 目标</span></div>
   <div><label>下行延迟 (ms)</label><input id="down_delay_ms" type="number" min="0" style="width:110px"> <span class="muted">目标 → 客户端</span></div>
+  <div><label>停滞时限 (s)</label><input id="stall_timeout_s" type="number" min="1" max="30" step="1" style="width:110px"> <span class="muted">1～30；双向无实际转发超过该值即断开；延迟期内的已读数据不误判，延迟期结束后最多再等一个时限</span></div>
   <div style="margin-top:8px"><button id="saveBtn">保存配置</button> <span id="cfgStatus"></span></div>
-  <div class="muted" style="margin-top:6px">每条连接沿用建立时的配置，新配置只影响之后建立的连接；修改监听地址/端口会重启监听器（已有连接不受影响）。</div>
+  <div class="muted" style="margin-top:6px">每条连接沿用建立时的配置（含停滞时限），新配置只影响之后建立的连接；修改监听地址/端口会重启监听器（已有连接不受影响）。目标填 receiver-stopread / receiver-noreceipt 可模拟目标停读、不回执。</div>
 </div>
 
 <div class="card">
@@ -64,7 +67,7 @@ async function loadConfig() {
   const r = await fetch("/api/config");
   const d = await r.json();
   const c = d.config;
-  for (const k of ["listen_host","listen_port","target_host","target_port","up_delay_ms","down_delay_ms"])
+  for (const k of ["listen_host","listen_port","target_host","target_port","up_delay_ms","down_delay_ms","stall_timeout_s"])
     $(k).value = c[k];
   $("cfgStatus").innerHTML = d.listening
     ? `<span class="ok">● 监听中 ${esc(c.listen_host)}:${c.listen_port} → ${esc(c.target_host)}:${c.target_port}</span>`
@@ -79,6 +82,7 @@ async function saveConfig() {
     target_port: +$("target_port").value,
     up_delay_ms: +$("up_delay_ms").value,
     down_delay_ms: +$("down_delay_ms").value,
+    stall_timeout_s: +$("stall_timeout_s").value,
   };
   $("cfgStatus").textContent = "保存中…";
   try {
@@ -95,16 +99,20 @@ async function saveConfig() {
 
 const HEAD = `<tr><th>ID</th><th>状态</th><th>客户端</th><th>目标</th>` +
   `<th>上行字节</th><th>下行字节</th><th>上行缓冲<br>当前/峰值</th><th>下行缓冲<br>当前/峰值</th>` +
-  `<th>延迟ms<br>上/下</th><th>回执（下行尾部）</th><th>开始</th><th>结束</th><th>错误</th></tr>`;
+  `<th>延迟ms上/下<br>·停滞s</th><th>停滞（阶段·<br>已转↑/↓）</th><th>回执（下行尾部）</th><th>开始</th><th>结束</th><th>错误</th></tr>`;
 
 function connRow(c) {
   const receipt = (c.receipt || "").slice(-160);
+  const stall = c.stall
+    ? `<span class="unconf">${c.stall.phase === "up" ? "上行" : "等回执"}</span> ↑${fmtNum(c.stall.up_forwarded)} ↓${fmtNum(c.stall.down_forwarded)}`
+    : "-";
   return `<tr><td>${c.id}</td><td><span class="pill st-${c.state}">${c.state}</span></td>` +
     `<td>${esc(c.client)}</td><td>${esc(c.target)}</td>` +
     `<td class="num">${fmtNum(c.up.bytes)}</td><td class="num">${fmtNum(c.down.bytes)}</td>` +
     `<td class="num">${fmtNum(c.up.queued)} / ${fmtNum(c.up.peak)}</td>` +
     `<td class="num">${fmtNum(c.down.queued)} / ${fmtNum(c.down.peak)}</td>` +
-    `<td class="num">${c.up_delay_ms} / ${c.down_delay_ms}</td>` +
+    `<td class="num">${c.up_delay_ms} / ${c.down_delay_ms} · ${c.stall_timeout_s}s</td>` +
+    `<td>${stall}</td>` +
     `<td>${esc(receipt)}</td><td>${fmtTime(c.started_at)}</td><td>${fmtTime(c.ended_at)}</td>` +
     `<td class="err">${esc(c.error || "")}</td></tr>`;
 }
@@ -135,9 +143,16 @@ async function doUpload() {
     const el = $("upResult");
     el.style.display = "block";
     el.textContent = JSON.stringify(d, null, 2);
-    $("upStatus").innerHTML = d.ok
-      ? `<span class="ok">完成：${fmtNum(d.bytes_sent)} 字节，${d.duration_ms} ms，回执：${esc(d.receipt || "")}</span>`
-      : `<span class="err">失败：${esc(d.error || ("HTTP " + r.status))}</span>`;
+    if (d.ok) {
+      $("upStatus").innerHTML = `<span class="ok">完成：${fmtNum(d.bytes_sent)} 字节，${d.duration_ms} ms，回执：${esc(d.receipt || "")}</span>`;
+    } else if (d.unconfirmed) {
+      const st = d.proxy_conn && d.proxy_conn.stall;
+      $("upStatus").innerHTML = `<span class="unconf">未确认：未收到回执` +
+        (st ? `（连接停滞于${st.phase === "up" ? "上行" : "等回执"}阶段，已终止）` : "") +
+        `</span> <span class="err">${esc(d.error || "")}</span>`;
+    } else {
+      $("upStatus").innerHTML = `<span class="err">失败：${esc(d.error || ("HTTP " + r.status))}</span>`;
+    }
   } catch (e) {
     $("upStatus").innerHTML = `<span class="err">请求失败：${esc(e.message)}</span>`;
   } finally {

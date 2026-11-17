@@ -10,6 +10,12 @@
 * 收到单向 EOF 后，先把该方向队列中待发字节全部写出，再转发半关闭
   (write_eof)；反向方向继续传输直到结束。
 * 断连（正常结束或对端 RST）时释放队列并关闭两侧连接。
+* 停滞时限（stall_timeout_s，接入时快照）：双向都没有“实际转发”
+  （写出并 drain 成功，或 EOF 送达对端）超过该时限时终止连接。
+  已读未写的数据仍在配置延迟期内（队首块未到投递时刻）不算停滞；
+  延迟期结束后仍无进展，最多再等一个停滞时限。上行 EOF 只在待发
+  字节冲刷完并转给目标后才算进展；下行未结束照常计时。停滞终止后
+  记录阶段（上行 / 等回执）与双向已转发字节，迟到的回执不覆盖该结果。
 """
 from __future__ import annotations
 
@@ -34,13 +40,24 @@ class ProxyConfig:
     target_port: int = 9000
     up_delay_ms: float = 300.0    # 客户端 -> 目标
     down_delay_ms: float = 300.0  # 目标 -> 客户端
+    stall_timeout_s: float = 10.0  # 双向无实际转发的停滞时限（1~30 秒）
 
 
 @dataclass
 class DirectionStats:
-    bytes: int = 0    # 已读累计字节
-    peak: int = 0     # 应用缓冲峰值
-    queued: int = 0   # 当前缓冲字节
+    bytes: int = 0      # 已读累计字节
+    forwarded: int = 0  # 实际转发（写出并 drain 成功）累计字节
+    peak: int = 0       # 应用缓冲峰值
+    queued: int = 0     # 当前缓冲字节
+
+
+@dataclass
+class StallInfo:
+    phase: str           # up=上行阶段 | receipt=等回执阶段
+    timeout_s: float     # 该连接接入时的停滞时限
+    up_forwarded: int    # 判定时上行已转发字节
+    down_forwarded: int  # 判定时下行已转发字节
+    at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -50,8 +67,9 @@ class ConnInfo:
     cfg: ProxyConfig  # 建立时的配置快照
     started_at: float = field(default_factory=time.time)
     ended_at: float | None = None
-    state: str = "active"  # active | closed | error
+    state: str = "active"  # active | closed | error | stalled
     error: str | None = None
+    stall: StallInfo | None = None  # 停滞判定结果（迟到回执不覆盖）
     up: DirectionStats = field(default_factory=DirectionStats)    # 客户端 -> 目标
     down: DirectionStats = field(default_factory=DirectionStats)  # 目标 -> 客户端
     downlink_tail: bytes = b""  # 下行数据尾部（回执预览）
@@ -72,6 +90,23 @@ class DirectionPump:
         self._space = asyncio.Event()   # 缓冲未满
         self._space.set()
         self._items = asyncio.Event()   # 队列非空
+        # 与 asyncio 事件循环同一单调时钟（loop.time() == time.monotonic()）
+        self._last_progress = time.monotonic()  # 最后一次实际转发时刻
+        self.eof_forwarded = False              # EOF 已冲刷并转给对端
+
+    def stall_deadline(self, timeout_s: float) -> float:
+        """该向允许停滞到的时刻；超过即视为该向无进展。
+
+        基准 = max(最后一次实际转发时刻, 队首块的投递时刻)：已读未写的数据
+        仍在配置延迟期内（队首 ready_at 在未来）不算停滞；延迟期结束后仍
+        无进展，最多再等一个停滞时限。
+        """
+        base = self._last_progress
+        if self._queue:
+            ready_at = self._queue[0][0]
+            if ready_at > base:
+                base = ready_at
+        return base + timeout_s
 
     async def run(self):
         rx = asyncio.create_task(self._read_loop(), name=f"pump-{self.name}-rx")
@@ -123,7 +158,8 @@ class DirectionPump:
                 await asyncio.sleep(wait)
             self._queue.popleft()
             if chunk is None:
-                # 该向待发字节已全部写出 -> 转发半关闭
+                # 该向待发字节已全部写出 -> 转发半关闭；
+                # EOF 实际转给对端后才算进展（上行 EOF 须先冲刷再送达目标）
                 try:
                     if self.writer.can_write_eof():
                         self.writer.write_eof()
@@ -132,11 +168,15 @@ class DirectionPump:
                         self.writer.close()
                 except (ConnectionError, OSError, RuntimeError):
                     pass
+                self.eof_forwarded = True
+                self._last_progress = time.monotonic()
                 return
             self.writer.write(chunk)
             await self.writer.drain()
             self._queued -= len(chunk)
             self.stats.queued = self._queued
+            self.stats.forwarded += len(chunk)
+            self._last_progress = time.monotonic()  # 实际转发进展
             if self.on_data is not None:
                 self.on_data(chunk)
             if self._queued < BUFFER_LIMIT:
@@ -181,15 +221,46 @@ class Connection:
                              cfg.down_delay_ms / 1000.0, info.down,
                              on_data=self._capture_downlink)
         tasks = [asyncio.create_task(up.run()), asyncio.create_task(down.run())]
+
+        async def stall_watchdog():
+            # 双向都没有实际转发超过接入时的停滞时限 -> 终止该连接。
+            # 上行 EOF 未送达目标前为上行阶段，之后为等回执阶段（下行照常计时）。
+            timeout = cfg.stall_timeout_s
+            while True:
+                now = time.monotonic()
+                up_dl = up.stall_deadline(timeout)
+                down_dl = down.stall_deadline(timeout)
+                if now >= up_dl and now >= down_dl:
+                    info.state = "stalled"
+                    info.stall = StallInfo(
+                        phase="receipt" if up.eof_forwarded else "up",
+                        timeout_s=timeout,
+                        up_forwarded=info.up.forwarded,
+                        down_forwarded=info.down.forwarded)
+                    info.error = (f"stalled: no forward progress in both directions "
+                                  f"for > {timeout:g}s (phase={info.stall.phase})")
+                    for t in tasks:
+                        t.cancel()
+                    return
+                await asyncio.sleep(max(0.05, min(up_dl, down_dl) - now))
+
+        watchdog = asyncio.create_task(stall_watchdog(), name=f"conn-{info.id}-stallwatch")
         try:
             await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            if info.state != "stalled":
+                raise  # 外部取消（关停等），照常传播
+            # 停滞看门狗取消了泵：结果已记录，正常走收尾
         except Exception as exc:
-            info.state = "error"
-            info.error = f"{type(exc).__name__}: {exc}"
+            if info.state == "active":  # 不覆盖停滞结果
+                info.state = "error"
+                info.error = f"{type(exc).__name__}: {exc}"
         finally:
+            watchdog.cancel()
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(watchdog, return_exceptions=True)
             # 断连：关闭两侧连接（队列已在 pump 内释放）
             self._close(self.client_writer)
             self._close(self.target_writer)
@@ -270,6 +341,16 @@ class DelayProxy:
         if conn is not None:
             self.history.appendleft(conn.info)
 
+    def find_by_client(self, client: str) -> ConnInfo | None:
+        """按客户端地址（ip:port）找连接记录，先活动后历史。"""
+        for c in self.active.values():
+            if c.info.client == client:
+                return c.info
+        for info in self.history:
+            if info.client == client:
+                return info
+        return None
+
     async def shutdown(self):
         if self.server is not None:
             self.server.close()
@@ -291,6 +372,8 @@ class DelayProxy:
                 "target": f"{info.cfg.target_host}:{info.cfg.target_port}",
                 "up_delay_ms": info.cfg.up_delay_ms,
                 "down_delay_ms": info.cfg.down_delay_ms,
+                "stall_timeout_s": info.cfg.stall_timeout_s,
+                "stall": dataclasses.asdict(info.stall) if info.stall else None,
                 "started_at": info.started_at,
                 "ended_at": info.ended_at,
                 "up": dataclasses.asdict(info.up),

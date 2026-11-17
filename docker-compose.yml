@@ -1,8 +1,26 @@
 services:
-  receiver:
+  receiver:                    # 正常接收端：读到 EOF 后回 RECEIPT
     build: ./receiver
     environment:
       PORT: "9000"
+      MODE: normal
+    expose:
+      - "9000"
+
+  receiver-stopread:           # 模拟目标停读：读满 128 KiB 后停读但保持连接
+    build: ./receiver
+    environment:
+      PORT: "9000"
+      MODE: stop-read
+      STOP_READ_AFTER_BYTES: "131072"
+    expose:
+      - "9000"
+
+  receiver-noreceipt:          # 模拟不回执：读到 EOF 后不发回执、保持连接
+    build: ./receiver
+    environment:
+      PORT: "9000"
+      MODE: no-receipt
     expose:
       - "9000"
 
@@ -11,12 +29,15 @@ services:
     environment:
       LISTEN_HOST: 0.0.0.0
       LISTEN_PORT: "7000"        # TCP 延迟代理监听端口
-      TARGET_HOST: receiver      # 目标地址（可在网页上改）
+      TARGET_HOST: receiver      # 目标地址（可在网页上改：receiver / receiver-stopread / receiver-noreceipt）
       TARGET_PORT: "9000"
       UP_DELAY_MS: "300"         # 上行延迟：客户端 -> 目标
       DOWN_DELAY_MS: "300"       # 下行延迟：目标 -> 客户端
+      STALL_TIMEOUT_S: "10"      # 停滞时限：双向无实际转发超过该秒数即断开（1~30）
     ports:
       - "8000:8000"              # 网页 / API
       - "7000:7000"              # TCP 延迟代理（可直接对接设备/客户端）
     depends_on:
       - receiver
+      - receiver-stopread
+      - receiver-noreceipt
